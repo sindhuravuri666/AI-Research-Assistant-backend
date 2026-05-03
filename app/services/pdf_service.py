@@ -1,7 +1,7 @@
 import uuid
 from pathlib import Path
 from typing import List, Dict
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.utils.pdf_utils import extract_pdf_pages
 from app.core.config import UPLOAD_DIR
 from app.models.schemas import UploadResponse

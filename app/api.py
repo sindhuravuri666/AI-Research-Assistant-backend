@@ -1,7 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from typing import List
 from uuid import uuid4
+
 from app.core.config import OLLAMA_HOST, OLLAMA_LLM_MODEL, OLLAMA_EMBED_MODEL
 from app.models.schemas import (
     UploadResponse,
@@ -34,45 +34,119 @@ ALLOWED_EXTENSIONS = {".pdf"}
 
 
 def validate_pdf(filename: str) -> None:
-    suffix = filename.lower().rsplit('.', 1)[-1] if '.' in filename else ''
+    if not filename:
+        raise HTTPException(status_code=400, detail="Invalid file name.")
+
+    suffix = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
     if f".{suffix}" not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Only PDF uploads are allowed.")
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Only PDF uploads are allowed."
+        )
+
+
+def process_pdf_upload(upload: UploadFile, data: bytes):
+    validate_pdf(upload.filename)
+
+    if not data:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{upload.filename} is empty."
+        )
+
+    paper_id = upload.filename.replace(" ", "_")
+    paper_id = f"{paper_id}-{uuid4().hex[:8]}"
+
+    saved_path = pdf_service.save_pdf(upload.filename, data)
+    pages = pdf_service.parse_pdf(saved_path)
+
+    if not pages:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Uploaded PDF {upload.filename} has no extractable text."
+        )
+
+    chunks = pdf_service.chunk_text(paper_id, upload.filename, pages)
+
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No chunks were created for {upload.filename}."
+        )
+
+    embeddings = embedding_service.embed_chunks(
+        [chunk["text"] for chunk in chunks]
+    )
+
+    vector_store.add_embeddings(embeddings, chunks)
+
+    return pdf_service.build_upload_response(
+        paper_id,
+        upload.filename,
+        len(pages),
+        len(chunks),
+    )
 
 
 @router.get("/health")
 def health_check():
     ollama_running = ollama_client.check_health()
-    status = {
+
+    return {
         "status": "ok" if ollama_running else "warning",
         "details": {
             "ollama_host": OLLAMA_HOST,
             "llm_model": OLLAMA_LLM_MODEL,
             "embed_model": OLLAMA_EMBED_MODEL,
+            "ollama_running": ollama_running,
             "faiss_index_exists": vector_store.index.ntotal > 0,
         },
     }
-    return status
 
 
-@router.post("/upload", response_model=List[UploadResponse])
-async def upload_papers(files: List[UploadFile] = File(...)):
-    if not files:
-        raise HTTPException(status_code=400, detail="No PDF uploaded.")
+@router.post("/upload", response_model=UploadResponse)
+async def upload_paper(file: UploadFile = File(...)):
+    try:
+        data = await file.read()
+        return process_pdf_upload(file, data)
+
+    except OllamaClientError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload paper: {str(exc)}"
+        )
+
+
+@router.post("/upload-multiple", response_model=List[UploadResponse])
+async def upload_multiple_papers(files: List[UploadFile] = File(...)):
     responses = []
-    for upload in files:
-        validate_pdf(upload.filename)
-        data = await upload.read()
-        paper_id = upload.filename.replace(" ", "_")
-        paper_id = f"{paper_id}-{uuid4().hex[:8]}"
-        saved_path = pdf_service.save_pdf(upload.filename, data)
-        pages = pdf_service.parse_pdf(saved_path)
-        if not pages:
-            raise HTTPException(status_code=400, detail=f"Uploaded PDF {upload.filename} has no extractable text.")
-        chunks = pdf_service.chunk_text(paper_id, upload.filename, pages)
-        embeddings = embedding_service.embed_chunks([chunk["text"] for chunk in chunks])
-        vector_store.add_embeddings(embeddings, chunks)
-        responses.append(pdf_service.build_upload_response(paper_id, upload.filename, len(pages), len(chunks)))
-    return responses
+
+    try:
+        for file in files:
+            data = await file.read()
+            response = process_pdf_upload(file, data)
+            responses.append(response)
+
+        return responses
+
+    except OllamaClientError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload papers: {str(exc)}"
+        )
 
 
 @router.get("/papers", response_model=List[PaperMeta])
@@ -84,16 +158,35 @@ def get_papers():
 def get_paper(paper_id: str):
     papers = vector_store.get_all_papers()
     paper = next((item for item in papers if item["paper_id"] == paper_id), None)
+
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found.")
-    breakdown = agent_service.generate_breakdown(paper_id, paper["file_name"])
-    return PaperDetail(**paper, breakdown=breakdown)
+
+    try:
+        breakdown = agent_service.generate_breakdown(
+            paper_id,
+            paper["file_name"]
+        )
+        return PaperDetail(**paper, breakdown=breakdown)
+
+    except OllamaClientError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.post("/chat", response_model=ChatAnswer)
 def chat(request: ChatRequest):
+    if vector_store.index.ntotal == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No papers uploaded yet. Please upload a PDF first."
+        )
+
     try:
-        return agent_service.answer_question(request.question, request.explain_like_im_five)
+        return agent_service.answer_question(
+            request.question,
+            request.explain_like_im_five
+        )
+
     except OllamaClientError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
@@ -101,26 +194,60 @@ def chat(request: ChatRequest):
 @router.post("/compare", response_model=CompareAnswer)
 def compare(request: CompareRequest):
     papers = vector_store.get_all_papers()
-    selected = [paper for paper in papers if paper["paper_id"] in request.paper_ids]
+
+    selected = [
+        paper for paper in papers
+        if paper["paper_id"] in request.paper_ids
+    ]
+
     if len(selected) < 2:
-        raise HTTPException(status_code=400, detail="Select at least two papers to compare.")
-    paper_map = {paper["paper_id"]: paper["file_name"] for paper in selected}
-    return agent_service.compare_papers(request.paper_ids, paper_map)
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least two uploaded papers to compare."
+        )
+
+    try:
+        paper_map = {
+            paper["paper_id"]: paper["file_name"]
+            for paper in selected
+        }
+
+        return agent_service.compare_papers(request.paper_ids, paper_map)
+
+    except OllamaClientError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.post("/notes")
 def notes(request: NotesRequest):
     if not request.paper_ids:
         raise HTTPException(status_code=400, detail="No paper IDs provided.")
-    content = agent_service.generate_notes(request.paper_ids, request.mode)
-    return {"notes": content}
+
+    try:
+        content = agent_service.generate_notes(request.paper_ids, request.mode)
+        return {"notes": content}
+
+    except OllamaClientError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.post("/ideas")
 def ideas(request: IdeaRequest):
     all_papers = vector_store.get_all_papers()
-    paper_ids = request.paper_ids or [paper["paper_id"] for paper in all_papers]
+
+    paper_ids = request.paper_ids or [
+        paper["paper_id"] for paper in all_papers
+    ]
+
     if not paper_ids:
-        raise HTTPException(status_code=400, detail="No papers are uploaded yet.")
-    content = agent_service.generate_ideas(paper_ids)
-    return {"ideas": content}
+        raise HTTPException(
+            status_code=400,
+            detail="No papers are uploaded yet."
+        )
+
+    try:
+        content = agent_service.generate_ideas(paper_ids)
+        return {"ideas": content}
+
+    except OllamaClientError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
