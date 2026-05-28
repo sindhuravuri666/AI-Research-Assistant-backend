@@ -22,9 +22,9 @@ class OllamaClient:
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
         payload = {
             "model": OLLAMA_EMBED_MODEL,
-            "text": texts,
+            "input": texts,
         }
-        data = self._request("/embed", payload)
+        data = self._request("/api/embed", payload)
         if "embeddings" not in data:
             raise OllamaClientError("Embedding response did not include embeddings")
         return data["embeddings"]
@@ -34,18 +34,17 @@ class OllamaClient:
             "model": OLLAMA_LLM_MODEL,
             "prompt": prompt,
             "temperature": temperature,
-            "max_tokens": max_tokens,
+            "num_predict": max_tokens,
+            "stream": False,
         }
-        data = self._request("/predict", payload)
-        if "output" not in data:
-            raise OllamaClientError("LLM response did not include output")
-        if isinstance(data["output"], list):
-            return "\n".join(str(item) for item in data["output"])
-        return str(data["output"])
+        data = self._request("/api/generate", payload)
+        if "response" not in data:
+            raise OllamaClientError("LLM response did not include response")
+        return str(data["response"])
 
     def check_health(self) -> bool:
         try:
-            response = requests.get(f"{self.host}/v1/models", timeout=10)
+            response = requests.get(f"{self.host}/api/tags", timeout=10)
             response.raise_for_status()
             return True
         except Exception:

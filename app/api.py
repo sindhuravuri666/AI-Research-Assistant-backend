@@ -92,14 +92,25 @@ def process_pdf_upload(upload: UploadFile, data: bytes):
 @router.get("/health")
 def health_check():
     ollama_running = ollama_client.check_health()
+    
+    # Try to test the embedding endpoint
+    embedding_test = False
+    embedding_error = None
+    try:
+        test_embeddings = ollama_client.embed_texts(["test"])
+        embedding_test = len(test_embeddings) > 0
+    except Exception as e:
+        embedding_error = str(e)
 
     return {
-        "status": "ok" if ollama_running else "warning",
+        "status": "ok" if ollama_running and embedding_test else "warning",
         "details": {
             "ollama_host": OLLAMA_HOST,
             "llm_model": OLLAMA_LLM_MODEL,
             "embed_model": OLLAMA_EMBED_MODEL,
             "ollama_running": ollama_running,
+            "embedding_working": embedding_test,
+            "embedding_error": embedding_error,
             "faiss_index_exists": vector_store.index.ntotal > 0,
         },
     }
